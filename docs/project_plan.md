@@ -1,5 +1,7 @@
 # OpenClaw Stock Monitor 项目方案与计划
 
+conda虚拟环境： conda activate openclaw_env
+
 ## 1. 数据源准备 (Data Source Preparation)
 - **本地数据库 (PostgreSQL)**: 确认并连接现有的 `kline_qfq` (前复权日K线)、`stock_list` (股票列表)、`trading_calendar` (交易日历) 表。
 - **摩码云服API集成**: 编写 Python 脚本，通过摩码云服 API 定时下载并落库以下增量数据：
