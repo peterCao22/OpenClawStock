@@ -1,6 +1,13 @@
 from sqlalchemy import Column, String, Integer, Float, Date, BigInteger
 from scripts.db_session import Base
 
+class StockList(Base):
+    """股票列表 (现有表)"""
+    __tablename__ = "stock_list"
+    
+    instrument = Column(String(20), primary_key=True, comment="股票代码 e.g. 000001.SZ")
+    name = Column(String(50), comment="股票名称")
+
 class CategoryTree(Base):
     """指数、行业、概念树"""
     __tablename__ = "moma_category_tree"
@@ -29,6 +36,7 @@ class StockBasic(Base):
     tv = Column(Float, comment="总股本")
     pk = Column(Float, comment="最小价格变动单位")
     is_suspend = Column(Integer, name="is", comment="股票停牌状态")
+    updated_at = Column(Date, comment="更新日期")
 
 class FinancialIndex(Base):
     """财务主要指标"""

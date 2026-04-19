@@ -2,19 +2,23 @@ import os
 import sys
 import json
 import time
-import subprocess
 from datetime import datetime
 
-# 添加项目根目录到路径
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# 添加当前目录到路径，以便导入同级模块和子模块
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(current_dir)
 
 # 导入工具函数
-from scripts.tools.get_realtime_quotes import get_quotes
-from scripts.tools.send_feishu_alert import send_feishu_card
+# 注意：这里假设 tools 文件夹在当前目录下
+from tools.get_realtime_quotes import get_quotes
+from tools.send_feishu_alert import send_feishu_card
+from moma_api_client import MomaApiClient
 
 def load_targets():
     """加载监控目标"""
     try:
+        # 假设 targets 文件在 workspace/results/monitoring_targets.json
+        # 而本脚本在 workspace/src/stock_monitor.py
         targets_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "results", "monitoring_targets.json")
         with open(targets_path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -23,15 +27,7 @@ def load_targets():
         return []
 
 def get_market_data(codes):
-    """获取实时行情 (调用 get_realtime_quotes.py 的逻辑)"""
-    # 这里我们直接调用工具脚本中的函数，或者复用其逻辑
-    # 为了简单，我们直接调用该脚本并捕获输出，或者直接使用 moma_api_client
-    # 由于 get_realtime_quotes.py 已经封装好了逻辑，我们直接用 subprocess 调用它可能更解耦
-    # 但为了性能，最好直接 import。我们上面已经 import 了 get_quotes 的逻辑，但 get_quotes 是打印到 stdout 的。
-    # 我们需要修改 get_realtime_quotes.py 让它返回数据，或者在这里重写逻辑。
-    # 让我们重写逻辑以获得更好的控制。
-    
-    from scripts.moma_api_client import MomaApiClient
+    """获取实时行情"""
     client = MomaApiClient()
     
     # Moma API expects comma-separated string
@@ -161,7 +157,7 @@ def main():
 
 if __name__ == "__main__":
     # 可以通过命令行参数控制是否循环运行
-    # python scripts/stock_monitor.py --loop
+    # python stock_monitor.py --loop
     
     if "--loop" in sys.argv:
         while True:

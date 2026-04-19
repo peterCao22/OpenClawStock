@@ -4,6 +4,11 @@ import requests
 from dotenv import load_dotenv
 
 # 加载项目根目录的 .env 文件
+# 假设部署结构:
+# workspace/
+#   .env
+#   src/ (或 scripts/)
+#     moma_api_client.py
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
 
 MOMA_API_URL = os.getenv("MOMA_API_URL", "http://api.momaapi.com").rstrip("/")
