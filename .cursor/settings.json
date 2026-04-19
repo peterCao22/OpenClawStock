@@ -1,0 +1,10 @@
+{
+  "plugins": {
+    "cli-for-agent": {
+      "enabled": true
+    },
+    "tavily": {
+      "enabled": true
+    }
+  }
+}

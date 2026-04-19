@@ -1,0 +1,29 @@
+
+1
+python scripts/phase4_weekly_screener.py --as-of 2024-05-24 --top-n 250 --output output/phase4_full_20240524.json
+
+2
+python scripts/phase4b_screener.py --as-of 2024-05-24 --top-n 100 --output output/phase4b_full_20240524.json
+
+3
+python scripts/phase4_merge_candidates.py ^
+  --phase4a output/phase4_full_20240524.json ^
+  --phase4b output/phase4b_full_20240524.json ^
+  --output output/phase4_merged_20240524.json
+  
+4
+python scripts/phase4_export_monitoring_targets.py ^
+  --merged output/phase4_merged_20240524.json ^
+  --head 300 ^
+  --output results/monitoring_targets.json
+
+5 回测
+
+python scripts/phase4_backtest.py --candidates output/phase4_merged_20240524.json ^
+  --start-date 2024-05-24 --end-date 2024-08-24
+  
+6 验证
+python scripts/phase4_simulate_monitor_vs_backtest.py ^
+  --merged output/phase4_merged_20240524.json ^
+  --backtest-csv output/phase4_merged_20240524_backtest.csv ^
+  --head 300 --gainer-top-n 50 --target-capture 0.7 --solve-min-head

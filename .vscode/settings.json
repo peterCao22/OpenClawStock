@@ -1,0 +1,10 @@
+{
+    "python.defaultInterpreterPath": "C:\\ProgramData\\miniconda3\\envs\\openclaw_env\\python.exe",
+    "python.analysis.extraPaths": [
+        "./scripts"
+    ],
+    "cursorpyright.analysis.extraPaths": [
+        "./scripts"
+    ],
+    "claudeCodeChat.permissions.yoloMode": false
+}

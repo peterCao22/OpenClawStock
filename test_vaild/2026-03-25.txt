@@ -1,0 +1,42 @@
+
+1
+python scripts/phase4_weekly_screener.py --as-of 2026-03-24 --top-n 250 --output output/phase4_full_20260324.json
+
+2
+python scripts/phase4b_screener.py --as-of 2026-03-24 --top-n 100 --output output/phase4b_full_20260324.json
+
+3
+python scripts/phase4_merge_candidates.py ^
+  --phase4a output/phase4_full_20260324.json ^
+  --phase4b output/phase4b_full_20260324.json ^
+  --output output/phase4_merged_20260324.json
+  
+4
+python scripts/phase4_export_monitoring_targets.py ^
+  --merged output/phase4_merged_20260324.json ^
+  --head 300 ^
+  --output results/monitoring_targets.json
+
+5 回测
+
+python scripts/phase4_backtest.py --candidates output/phase4_merged_20260324.json ^
+  --start-date 2026-03-24 --end-date 2024-08-24
+  
+6 验证
+python scripts/phase4_simulate_monitor_vs_backtest.py ^
+  --merged output/phase4_merged_20260324.json ^
+  --backtest-csv output/phase4_merged_20260324_backtest.csv ^
+  --head 300 --gainer-top-n 50 --target-capture 0.7 --solve-min-head
+  
+  
+# 2026-04-20 添加了月线，在日常更新K线数据，会自动同步kline_qfq_monthly，但也可手动：
+# 全市场重建（清空月表再按全库日线重算，首次或怀疑不一致时用）
+python scripts/build_kline_qfq_monthly.py --rebuild
+
+# 只重算指定几只（日常修数、或某几只日线刚补完）
+python scripts/build_kline_qfq_monthly.py --instruments 002082.SZ 002413.SZ
+
+但是如果日常更新update_kline_qfqupdate_kline_qfq.py 不带参数，也会自动更新月K线表。
+
+# 执行4种形态的股票筛选命令
+python scripts/quant_picker.py --t_date 2026-03-12 --top_k 50
