@@ -123,3 +123,45 @@ class MomaApiClient:
     def get_stock_list(self):
         """获取基础的股票代码和名称"""
         return self._request("hslt/list")
+
+    def get_hsindex_list(self):
+        """获取沪深两市主要指数代码与名称列表。
+
+        参数:
+            无
+
+        返回:
+            list[dict] | None: 元素含 dm(指数代码如 000001.SH)、mc(名称)、jys(交易所)
+        """
+        return self._request("hsindex/list")
+
+    def get_hsindex_history(self, index_code, period="d", st=None, et=None):
+        """获取指数历史分时 K 线（交易时间升序）。
+
+        参数:
+            index_code: 指数代码，如 000001.SH、000300.SH
+            period: 分时级别，日线为 d（5/15/30/60/w/m/y 见官方文档）
+            st: 开始时间 YYYYMMDD 或 YYYYMMDDhhmmss，可选
+            et: 结束时间，格式同 st，可选
+
+        返回:
+            list[dict] | None: 元素含 t,o,h,l,c,v,a,pc 等字段
+        """
+        params = {}
+        if st:
+            params["st"] = st
+        if et:
+            params["et"] = et
+        return self._request(f"hsindex/history/{index_code}/{period}", params=params)
+
+    def get_hsindex_latest(self, index_code, period="d"):
+        """获取指数最新分时 K 线（通常仅最近若干条，适合盘中增量探测）。
+
+        参数:
+            index_code: 指数代码，如 000001.SH
+            period: 分时级别，日线为 d
+
+        返回:
+            list[dict] | None: 结构与 history 接口一致
+        """
+        return self._request(f"hsindex/latest/{index_code}/{period}")

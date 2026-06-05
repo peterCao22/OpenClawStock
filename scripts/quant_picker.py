@@ -24,8 +24,13 @@
             * 1.f 6 月主升浪（涨幅 ∈ [30%, 120%]）；
             * 1.g 有效突破前 2~3 月连涨；
             * 附加：连续 2 月月收 ≥ ma60_m 且 2 月累计涨幅 ≤ 40%。
-    9. 综合 ``final_score = total_score + monthly_bonus``，降序取 Top-K，写入
-       ``results/top_{K}_stocks_{T}.json``。
+    9. ``compute_t_day_quality`` 在 T 日计算动量确认指标（收盘/3年高点、反弹后是否
+       仍创新高等）及 ``quality_bonus``；综合
+       ``final_score = total_score + monthly_bonus + quality_bonus``，降序取 Top-K，
+       写入 ``results/top_{K}_stocks_{T}.json``。
+    10. N 型识别要求 W2 为有效洗盘（方向 DOWN 且振幅 ≤ -10%），过滤「假 N」连续逼空结构。
+    11. ``--watchlist`` 模式：仅输出四绿灯全满足（站稳3年高点、反弹后仍创新高、
+        仍高于 C 点、W2 有效洗盘）的候选，写入 ``results/watchlist_{T}.json``。
 
 数据口径：
     - 日期为 ``YYYY-MM-DD`` 字符串与交易日对齐；K 线为前复权（表 ``kline_qfq``）。
@@ -42,6 +47,7 @@
     python scripts/quant_picker.py
     python scripts/quant_picker.py --t_date 2025-10-31 --top_k 30
     python scripts/quant_picker.py --debug_stock 002082.SZ --t_date 2025-10-31
+    python scripts/quant_picker.py --t_date 2026-04-17 --top_k 50 --watchlist
 
 注意：
     - 依赖 ``scripts.db_session`` 中的数据库连接；无数据或交易日不足时会记录错误并提前返回。
@@ -309,6 +315,16 @@ def segment_windows(df, t_date):
             
     return windows
 
+
+# ── T 日质量分 / N 型洗盘阈值（源自 2026-04-17 Top50 回测）────────────────────
+W2_WASH_MIN_DROP_PCT = -10.0           # N 型 W2 最低跌幅（%，负值表示至少跌 10%）
+QUALITY_BONUS_ABOVE_3Y_PEAK = 12       # T 日收盘 ≥ 3 年高点
+QUALITY_PENALTY_WELL_BELOW_3Y = -20    # T 日收盘 < 3 年高点 × 0.98
+QUALITY_BONUS_NEW_HIGH_SINCE_REBOUND = 10  # T 日仍为 rebound 以来收盘新高
+QUALITY_PENALTY_FAKE_WASH = -15        # W2 非有效洗盘（连续逼空结构）
+NEW_HIGH_TOLERANCE = 0.995             # 创新高判定容差
+
+
 def identify_pattern(windows, instrument):
     """
     在已算好的四窗口特征上识别 N / W / H / V 四类形态之一（互斥优先级：N → H → V → W）。
@@ -337,8 +353,14 @@ def identify_pattern(windows, instrument):
     w3_surge = w3['direction'] == 'UP' and w3['amplitude'] > thresh['surge_trigger']
     
     if (w4_surge or w3_surge):
+        # 方案 B：W2 必须是有效洗盘（DOWN 且跌幅≥10%），否则视为连续拉升后的「假 N」
+        w2_real_wash = (
+            w2['direction'] == 'DOWN' and w2['amplitude'] <= W2_WASH_MIN_DROP_PCT
+        )
+        if not w2_real_wash:
+            pass  # 不判 N，继续尝试 H/V/W
         # W1 需有真实涨幅且收盘接近当日高点，避免长上影假突破
-        if w1['direction'] == 'UP' and w1['close_end'] > w2['low']:
+        elif w1['direction'] == 'UP' and w1['close_end'] > w2['low']:
             prev_high = max(w4['high'], w3['high'])
             # 收复前高区约 85% 以上，才认为第二波有力
             if w1['high'] >= prev_high * 0.85:
@@ -1285,7 +1307,137 @@ def evaluate_monthly_rules(df_monthly, instrument):
     return True, info, bonus
 
 
-def run_quant_picker(t_date=None, top_k=20, debug_stock=None):
+def compute_t_day_quality(
+    group_df: pd.DataFrame,
+    windows: list,
+    monthly_info: dict,
+    micro_detail: dict,
+    t_date: str,
+) -> dict:
+    """
+    计算 T 日动量确认指标与 quality_bonus（方案 A）。
+
+    回测依据（2026-04-17 Top50 → 2026-06-04）：
+        - ``close_vs_3y_peak``、``at_new_high_since_rebound`` 与后续涨幅相关性最高；
+        - ``w2_is_real_wash`` 可区分真 N 型与连续逼空后的「假 N」。
+
+    参数:
+        group_df: 单票日线 DataFrame（含 date/close/high）。
+        windows: ``segment_windows`` 返回的四窗口列表，``windows[1]`` 为 W2。
+        monthly_info: ``evaluate_monthly_rules`` 返回的月线明细（含 peak_3y_value）。
+        micro_detail: ``score_stock_micro`` 返回的 ABC 微观明细（含 rebound_date）。
+        t_date: 选股锚定日 ``YYYY-MM-DD``。
+
+    返回:
+        dict，含 ``close_vs_3y_peak``、``at_new_high_since_rebound``、
+        ``w2_is_real_wash``、``quality_bonus``、``quality_tags`` 等字段。
+    """
+    df = group_df.copy()
+    df['_dt'] = pd.to_datetime(df['date'])
+    df = df.sort_values('_dt')
+    t_ts = pd.Timestamp(t_date)
+    sub = df[df['_dt'] <= t_ts]
+    if sub.empty:
+        return {
+            'close_vs_3y_peak': None,
+            'at_new_high_since_rebound': None,
+            'still_above_rebound_close': None,
+            'days_since_rebound': None,
+            'w2_is_real_wash': None,
+            'w2_direction': None,
+            'w2_amplitude': None,
+            'quality_bonus': 0,
+            'quality_tags': [],
+        }
+
+    t_close = float(sub.iloc[-1]['close'])
+    peak_3y = monthly_info.get('peak_3y_value')
+    close_vs_3y = round(t_close / float(peak_3y), 4) if peak_3y and float(peak_3y) > 0 else None
+
+    rebound_date = micro_detail.get('rebound_date')
+    days_since_rebound = None
+    still_above_rebound = None
+    at_new_high = None
+    if rebound_date:
+        rb_ts = pd.Timestamp(rebound_date)
+        days_since_rebound = int((t_ts - rb_ts).days)
+        rb_rows = df[df['_dt'] == rb_ts]
+        if not rb_rows.empty:
+            rb_close = float(rb_rows.iloc[-1]['close'])
+            still_above_rebound = t_close >= rb_close
+            between = df[(df['_dt'] >= rb_ts) & (df['_dt'] <= t_ts)]
+            if not between.empty:
+                max_close = float(between['close'].max())
+                at_new_high = t_close >= max_close * NEW_HIGH_TOLERANCE
+
+    w2 = windows[1] if len(windows) >= 2 else {}
+    w2_dir = w2.get('direction')
+    w2_amp = w2.get('amplitude')
+    w2_is_real_wash = (
+        w2_dir == 'DOWN' and w2_amp is not None and w2_amp <= W2_WASH_MIN_DROP_PCT
+    )
+
+    bonus = 0
+    tags = []
+    if close_vs_3y is not None:
+        if close_vs_3y >= 1.0:
+            bonus += QUALITY_BONUS_ABOVE_3Y_PEAK
+            tags.append('站稳3年高点')
+        elif close_vs_3y < 0.98:
+            bonus += QUALITY_PENALTY_WELL_BELOW_3Y
+            tags.append('未突破3年高点')
+    if at_new_high is True:
+        bonus += QUALITY_BONUS_NEW_HIGH_SINCE_REBOUND
+        tags.append('反弹后仍创新高')
+    elif at_new_high is False:
+        tags.append('反弹后未创新高')
+    if w2_is_real_wash is False:
+        bonus += QUALITY_PENALTY_FAKE_WASH
+        tags.append('W2非有效洗盘')
+
+    return {
+        'close_vs_3y_peak': close_vs_3y,
+        'at_new_high_since_rebound': at_new_high,
+        'still_above_rebound_close': still_above_rebound,
+        'days_since_rebound': days_since_rebound,
+        'w2_is_real_wash': w2_is_real_wash,
+        'w2_direction': w2_dir,
+        'w2_amplitude': round(float(w2_amp), 2) if w2_amp is not None else None,
+        'quality_bonus': bonus,
+        'quality_tags': tags,
+    }
+
+
+def passes_watchlist_green(detail: dict) -> bool:
+    """
+    判断是否满足观盘「四绿灯」全部条件（用于 --watchlist 输出过滤）。
+
+    四绿灯（与回测 2026-04-17 Top50 总结一致）：
+        1. close_vs_3y_peak >= 1.0  — 收盘站稳 3 年高点
+        2. at_new_high_since_rebound — 反弹 C 点以来仍创新高
+        3. still_above_rebound_close — 收盘仍高于 C 点
+        4. w2_is_real_wash           — W2 为有效洗盘（真 N 结构）
+
+    参数:
+        detail: 已合并 ``compute_t_day_quality`` 字段的候选 dict。
+
+    返回:
+        bool，四条件全部满足时为 True。
+    """
+    cv3 = detail.get('close_vs_3y_peak')
+    if cv3 is None or cv3 < 1.0:
+        return False
+    # 使用 bool()：score/quality 链路中可能出现 numpy.bool_，不可直接用 ``is True``
+    if not bool(detail.get('at_new_high_since_rebound')):
+        return False
+    if not bool(detail.get('still_above_rebound_close')):
+        return False
+    if not bool(detail.get('w2_is_real_wash')):
+        return False
+    return True
+
+
+def run_quant_picker(t_date=None, top_k=20, debug_stock=None, watchlist_only=False):
     """
     全市场（或单票调试）执行选股流水线，并落盘 JSON 结果。
 
@@ -1293,16 +1445,19 @@ def run_quant_picker(t_date=None, top_k=20, debug_stock=None):
         t_date: 选股锚定日 ``YYYY-MM-DD``；``None`` 时用当前系统日期向库取不晚于该日的交易日历。
         top_k: 输出得分最高的前 K 只股票（默认 20）。
         debug_stock: 若指定证券代码（如 ``600519.SH``），只拉取该票并打印各阶段诊断日志。
+        watchlist_only: 为 True 时仅保留四绿灯全满足的候选（``--watchlist``）。
 
     返回:
-        无显式返回值；结果写入 ``results/top_{top_k}_stocks_{end_date}.json``，异常路径通过日志提示。
+        无显式返回值；结果写入 ``results/top_{top_k}_stocks_{end_date}.json`` 或
+        ``results/watchlist_{end_date}.json``（watchlist 模式），异常路径通过日志提示。
 
     注意:
         ``end_date`` 为所取交易日中的最后一天，未必等于 ``t_date``（当 ``t_date`` 非交易日时
         会落在最近的前一交易日）；``debug_stock`` 的 SQL 为字符串拼接，仅用于本地可信调试。
         日线主取数缩回 ~850 交易日；月线层走 ``kline_qfq_monthly`` 派生表 + T 当月 partial。
     """
-    logging.info(f"开始执行量化选股 (T日: {t_date or '最新'})")
+    logging.info(f"开始执行量化选股 (T日: {t_date or '最新'}"
+                 f"{', Watchlist四绿灯模式' if watchlist_only else ''})")
 
     # 主取数：~850 交易日（约 3.5 年）覆盖动态四窗口/形态识别/微观/趋势所需跨度。
     # 月线层数据已迁到派生月表（kline_qfq_monthly），不依赖此窗口长度。
@@ -1458,28 +1613,51 @@ def run_quant_picker(t_date=None, top_k=20, debug_stock=None):
         # 月线层可解释字段全部写入：方便 --debug_stock 与人工查验
         detail['monthly_bonus'] = monthly_bonus
         detail['monthly'] = monthly_info
-        # final_score = 微观分(原 total_score) + 月线 bonus；用于最终排序
-        detail['final_score'] = round(detail['total_score'] + monthly_bonus, 2)
+
+        # T 日动量确认（方案 A）：quality_bonus 参与最终排序
+        quality = compute_t_day_quality(group_df, windows, monthly_info, detail, end_date)
+        detail.update(quality)
+        detail['watchlist_pass'] = passes_watchlist_green(detail)
+        detail['final_score'] = round(
+            detail['total_score'] + monthly_bonus + quality['quality_bonus'], 2
+        )
 
         results.append(detail)
 
-    # 按 final_score 降序：让月线趋势加分项把"理想形态"（如 002082 万邦德）顶到前面
+    # 按 final_score 降序：微观分 + 月线 bonus + T 日 quality_bonus
     results.sort(key=lambda x: x['final_score'], reverse=True)
-    top_results = results[:top_k]
 
-    logging.info(f"--- 选股完成，TOP-{len(top_results)} ---")
+    if watchlist_only:
+        pool = [r for r in results if r.get('watchlist_pass')]
+        logging.info(
+            f"Watchlist 四绿灯过滤: 候选 {len(results)} 只 -> 通过 {len(pool)} 只"
+        )
+        top_results = pool[:top_k]
+        out_label = "Watchlist"
+    else:
+        top_results = results[:top_k]
+        out_label = f"TOP-{len(top_results)}"
+
+    logging.info(f"--- 选股完成，{out_label} ---")
     for i, res in enumerate(top_results, 1):
         # 控制台/日志只保留一行摘要；月线逐项诊断在 JSON 的 ``monthly`` 字段里
+        q_bonus = res.get('quality_bonus', 0)
+        q_tags = ','.join(res.get('quality_tags') or []) or '-'
+        wl = '✓' if res.get('watchlist_pass') else '✗'
         logging.info(
             f"{i:02d}. [{res['pattern']}] {res['instrument']} {res['name']} | "
-            f"final={res['final_score']} (micro={res['total_score']} + month={res['monthly_bonus']}) | "
-            f"{res['windows_info']}"
+            f"final={res['final_score']} "
+            f"(micro={res['total_score']} + month={res['monthly_bonus']} + quality={q_bonus}) | "
+            f"watchlist={wl} tags=[{q_tags}] | {res['windows_info']}"
         )
               
     if not os.path.exists('results'):
         os.makedirs('results')
-        
-    out_file = f"results/top_{top_k}_stocks_{end_date}.json"
+
+    if watchlist_only:
+        out_file = f"results/watchlist_{end_date}.json"
+    else:
+        out_file = f"results/top_{top_k}_stocks_{end_date}.json"
     pd.DataFrame(top_results).to_json(out_file, orient='records', force_ascii=False, indent=2)
     logging.info(f"结果已保存至 {out_file}")
     
@@ -1487,7 +1665,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="OpenClaw 量化选股：动态窗口形态(N/W/H/V) + A→B→C 微观分 + 月线/周线趋势加权。",
         epilog="示例: python scripts/quant_picker.py --t_date 2025-10-31 --top_k 30\n"
-        "调试单票: python scripts/quant_picker.py --debug_stock 002082.SZ --t_date 2025-10-31",
+        "调试单票: python scripts/quant_picker.py --debug_stock 002082.SZ --t_date 2025-10-31\n"
+        "四绿灯观盘池: python scripts/quant_picker.py --t_date 2026-04-17 --watchlist --top_k 50",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -1503,6 +1682,17 @@ if __name__ == "__main__":
         default=None,
         help='仅分析该 instrument（如 600519.SH），并输出窗口/形态/评分详细日志',
     )
+    parser.add_argument(
+        '--watchlist',
+        action='store_true',
+        help='仅输出四绿灯全满足的候选（站稳3年高点+反弹仍创新高+高于C点+W2有效洗盘），'
+             '结果写入 results/watchlist_{T}.json',
+    )
     args = parser.parse_args()
 
-    run_quant_picker(t_date=args.t_date, top_k=args.top_k, debug_stock=args.debug_stock)
+    run_quant_picker(
+        t_date=args.t_date,
+        top_k=args.top_k,
+        debug_stock=args.debug_stock,
+        watchlist_only=args.watchlist,
+    )

@@ -40,3 +40,10 @@ python scripts/build_kline_qfq_monthly.py --instruments 002082.SZ 002413.SZ
 
 # 执行4种形态的股票筛选命令
 python scripts/quant_picker.py --t_date 2026-03-12 --top_k 50
+
+
+# 四绿灯观盘池（推荐日常用这个做重点跟踪）
+python scripts/quant_picker.py --t_date 2026-04-17 --watchlist --top_k 50
+
+# 普通 Top-K（JSON 里也会带 watchlist_pass 字段，可自行筛选）
+python scripts/quant_picker.py --t_date 2026-04-17 --top_k 50
