@@ -213,16 +213,16 @@ def delete_monthly_for_instrument(conn, instrument: str) -> int:
 
 
 # ─── 取数 ────────────────────────────────────────────────────────────────────
-def fetch_all_instruments(conn) -> List[str]:
+def fetch_all_instruments() -> List[str]:
     """从 stock_list 取所有 instrument（与 update_kline_qfq.py 口径一致：排除空名）"""
     df = pd.read_sql(
         "SELECT instrument FROM stock_list WHERE name IS NOT NULL AND name != '' ORDER BY instrument",
-        conn,
+        engine,
     )
     return df['instrument'].tolist()
 
 
-def fetch_daily_for_instrument(conn, instrument: str) -> pd.DataFrame:
+def fetch_daily_for_instrument(instrument: str) -> pd.DataFrame:
     """单票全量日线（注意：用 SQL ORDER BY 才能保证 aggregate 顺序）"""
     return pd.read_sql(
         f"""
@@ -231,11 +231,11 @@ def fetch_daily_for_instrument(conn, instrument: str) -> pd.DataFrame:
         WHERE instrument = '{instrument}'
         ORDER BY date ASC
         """,
-        conn,
+        engine,
     )
 
 
-def fetch_daily_batch(conn, instruments: List[str]) -> pd.DataFrame:
+def fetch_daily_batch(instruments: List[str]) -> pd.DataFrame:
     """批量取多票全量日线（用于全量回填，比逐个票发 SQL 省 RTT）"""
     if not instruments:
         return pd.DataFrame()
@@ -247,7 +247,7 @@ def fetch_daily_batch(conn, instruments: List[str]) -> pd.DataFrame:
         WHERE instrument IN ({placeholders})
         ORDER BY instrument, date ASC
         """,
-        conn,
+        engine,
     )
 
 
@@ -270,7 +270,7 @@ def rebuild_all(conn, batch_size: int = 200) -> None:
     conn.commit()
     print('[rebuild] 表已 TRUNCATE')
 
-    instruments = fetch_all_instruments(conn)
+    instruments = fetch_all_instruments()
     total = len(instruments)
     print(f'[rebuild] 共 {total} 只票，分批 {batch_size}/批')
 
@@ -281,7 +281,7 @@ def rebuild_all(conn, batch_size: int = 200) -> None:
     for batch_start in range(0, total, batch_size):
         batch = instruments[batch_start:batch_start + batch_size]
         t_b = time.time()
-        df_batch = fetch_daily_batch(conn, batch)
+        df_batch = fetch_daily_batch(batch)
         if df_batch.empty:
             continue
         # 按 instrument 分组分别聚合 → upsert
@@ -313,7 +313,7 @@ def update_for_instruments(conn, instruments: List[str]) -> None:
     n_rows = 0
     t0 = time.time()
     for inst in instruments:
-        df_d = fetch_daily_for_instrument(conn, inst)
+        df_d = fetch_daily_for_instrument(inst)
         if df_d.empty:
             continue
         df_m = aggregate_monthly_for_instrument(df_d, exclude_current_month=True, today=today)
