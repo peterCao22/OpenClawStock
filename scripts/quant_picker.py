@@ -25,12 +25,13 @@
             * 1.g 有效突破前 2~3 月连涨；
             * 附加：连续 2 月月收 ≥ ma60_m 且 2 月累计涨幅 ≤ 40%。
     9. ``compute_t_day_quality`` 在 T 日计算动量确认指标（收盘/3年高点、反弹后是否
-       仍创新高等）及 ``quality_bonus``；综合
-       ``final_score = total_score + monthly_bonus + quality_bonus``，降序取 Top-K，
-       写入 ``results/top_{K}_stocks_{T}.json``。
+       仍创新高等）及 ``quality_bonus``；经 ``compute_final_score_with_adjustments`` 叠加
+       验证样本得出的减分/封顶后得到 ``final_score``，降序取 Top-K。
     10. N 型识别要求 W2 为有效洗盘（方向 DOWN 且振幅 ≤ -10%），过滤「假 N」连续逼空结构。
-    11. ``--watchlist`` 模式：仅输出四绿灯全满足（站稳3年高点、反弹后仍创新高、
-        仍高于 C 点、W2 有效洗盘）的候选，写入 ``results/watchlist_{T}.json``。
+    11. ``--watchlist`` 模式：四绿灯 + 大盘趋势（上证 MA20 上或沪深300 近20日≥0）+
+        排除锚点涨停 / W 底；弱势环境（环境分<30）不输出 watchlist。
+    12. **大盘择时（P0）**：选股日调用 ``market_env_score``；弱势减量、中性收紧分数带、
+        积极环境正常出手（详见 ``apply_market_env_pool_filter``）。
 
 数据口径：
     - 日期为 ``YYYY-MM-DD`` 字符串与交易日对齐；K 线为前复权（表 ``kline_qfq``）。
@@ -65,6 +66,7 @@ from datetime import datetime, timedelta
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from scripts.db_session import engine
+from scripts.market_env_score import env_features_at, env_score
 
 # 日志落盘到 logs/，同时输出到控制台，便于长时间批量选股时留痕
 if not os.path.exists('logs'):
@@ -323,6 +325,15 @@ QUALITY_PENALTY_WELL_BELOW_3Y = -20    # T 日收盘 < 3 年高点 × 0.98
 QUALITY_BONUS_NEW_HIGH_SINCE_REBOUND = 10  # T 日仍为 rebound 以来收盘新高
 QUALITY_PENALTY_FAKE_WASH = -15        # W2 非有效洗盘（连续逼空结构）
 NEW_HIGH_TOLERANCE = 0.995             # 创新高判定容差
+
+# ── 事后验证样本导出的 final_score 修正（2026-06 验证报告 P1/P3）────────────────
+ADJ_PENALTY_REBOUND_GE_50 = -12          # rebound_score≥50 可持有胜率偏低
+ADJ_PENALTY_W_BOTTOM = -10               # W 底结构长期偏弱
+ADJ_PENALTY_VOL_EXPAND_GE_1 = -5         # 月线 vol_expand_ratio≥1 放量组胜率更低
+ADJ_PENALTY_FINAL_GE_150 = -15           # final 原始分≥150 过热
+FINAL_SCORE_NEUTRAL_BAND = (120, 150)    # 中性/谨慎环境下允许的分数带（P0）
+ENV_WEAK_THRESHOLD = 30                  # 环境分 <30：弱势，减量/跳过 watchlist
+ENV_NORMAL_THRESHOLD = 60                # 环境分 ≥60：正常出手；30~60 收紧分数带
 
 
 def identify_pattern(windows, instrument):
@@ -1259,8 +1270,9 @@ def evaluate_monthly_rules(df_monthly, instrument):
             ratio_v = recent_vol / prev12_vol
             info['vol_expand_ratio'] = round(ratio_v, 2)
             if ratio_v >= 1.3:
-                info['bonus_1d'] = 10
-                bonus += 10
+                # P3：验证显示放量扩张组可持有胜率更低，bonus 减半（原 +10 → +5）
+                info['bonus_1d'] = 5
+                bonus += 5
 
     # =========================================================================
     # 加分 1.e：长期稳健站上 ma60_m
@@ -1346,11 +1358,22 @@ def compute_t_day_quality(
             'w2_is_real_wash': None,
             'w2_direction': None,
             'w2_amplitude': None,
+            'anchor_is_limit_up': None,
             'quality_bonus': 0,
             'quality_tags': [],
         }
 
     t_close = float(sub.iloc[-1]['close'])
+    inst = str(group_df['instrument'].iloc[0]) if 'instrument' in group_df.columns else ''
+    is_cyb = inst.startswith('30') or inst.startswith('68')
+    limit_pct = 19.5 if is_cyb else 9.5
+    pre_close = None
+    if 'pre_close' in sub.columns and pd.notna(sub.iloc[-1]['pre_close']):
+        pre_close = float(sub.iloc[-1]['pre_close'])
+    anchor_is_limit_up = False
+    if pre_close and pre_close > 0:
+        anchor_is_limit_up = (t_close / pre_close - 1) * 100 >= limit_pct
+
     peak_3y = monthly_info.get('peak_3y_value')
     close_vs_3y = round(t_close / float(peak_3y), 4) if peak_3y and float(peak_3y) > 0 else None
 
@@ -1403,14 +1426,102 @@ def compute_t_day_quality(
         'w2_is_real_wash': w2_is_real_wash,
         'w2_direction': w2_dir,
         'w2_amplitude': round(float(w2_amp), 2) if w2_amp is not None else None,
+        'anchor_is_limit_up': anchor_is_limit_up,
         'quality_bonus': bonus,
         'quality_tags': tags,
     }
 
 
-def passes_watchlist_green(detail: dict) -> bool:
+def compute_final_score_with_adjustments(detail: dict, pattern_desc: str) -> float:
+    """在 micro + monthly + quality 基础上叠加验证样本导出的修正项。
+
+    修正依据见 ``output/selection_report.md``（H=10 可持有胜率）：
+        - rebound_score≥50 减分；W 底减分；月线放量减分；总分≥150 过热减分。
+
+    参数:
+        detail:       已含 total_score / monthly_bonus / quality_bonus / rebound_score / monthly。
+        pattern_desc: 形态中文描述。
+
+    返回:
+        修正后的 ``final_score``（≥0）；并在 detail 写入 ``score_adjustment`` / ``adjustment_tags``。
     """
-    判断是否满足观盘「四绿灯」全部条件（用于 --watchlist 输出过滤）。
+    base = (
+        float(detail.get('total_score') or 0)
+        + float(detail.get('monthly_bonus') or 0)
+        + float(detail.get('quality_bonus') or 0)
+    )
+    adj = 0.0
+    tags: list = []
+
+    if float(detail.get('rebound_score') or 0) >= 50:
+        adj += ADJ_PENALTY_REBOUND_GE_50
+        tags.append('反弹分过高')
+    if pattern_desc and pattern_desc.startswith('W底'):
+        adj += ADJ_PENALTY_W_BOTTOM
+        tags.append('W底结构')
+    monthly = detail.get('monthly') or {}
+    ver = monthly.get('vol_expand_ratio')
+    if ver is not None and float(ver) >= 1.0:
+        adj += ADJ_PENALTY_VOL_EXPAND_GE_1
+        tags.append('月线放量')
+
+    score = base + adj
+    if score >= 150:
+        adj += ADJ_PENALTY_FINAL_GE_150
+        score = base + adj
+        tags.append('总分过热')
+
+    detail['score_adjustment'] = round(adj, 2)
+    detail['adjustment_tags'] = tags
+    return round(max(score, 0.0), 2)
+
+
+def apply_market_env_pool_filter(
+    results: list,
+    env_res: dict,
+    watchlist_only: bool,
+    top_k: int,
+) -> tuple:
+    """按大盘环境分过滤候选池并调整输出数量（P0）。
+
+    参数:
+        results:        已按 final_score 降序的候选列表。
+        env_res:        ``env_score`` 返回值（含 score / regime / suggest_ratio）。
+        watchlist_only: 是否为 watchlist 模式。
+        top_k:          用户请求的 Top-K。
+
+    返回:
+        (filtered_results, effective_top_k)
+    """
+    score = env_res.get('score')
+    if score is None:
+        return results, top_k
+
+    if score < ENV_WEAK_THRESHOLD:
+        logging.warning(
+            f"大盘环境弱势（分={score}，{env_res.get('regime')}），"
+            f"{'跳过 watchlist' if watchlist_only else f'Top-K 减半至 {max(1, top_k // 2)}'}"
+        )
+        if watchlist_only:
+            return [], top_k
+        return results, max(1, top_k // 2)
+
+    if score < ENV_NORMAL_THRESHOLD:
+        lo, hi = FINAL_SCORE_NEUTRAL_BAND
+        filtered = [r for r in results if lo <= r.get('final_score', 0) <= hi]
+        logging.info(
+            f"大盘环境中性/谨慎（分={score}，{env_res.get('regime')}）："
+            f"仅保留 final_score {lo}~{hi}，{len(results)} -> {len(filtered)} 只"
+        )
+        return filtered, top_k
+
+    logging.info(f"大盘环境积极（分={score}，{env_res.get('regime')}），正常出手")
+    return results, top_k
+
+
+def passes_watchlist_green(detail: dict, market_feat=None) -> bool:
+    """
+    判断是否满足观盘「四绿灯」及验证样本衍生的附加条件（P2）。
 
     四绿灯（与回测 2026-04-17 Top50 总结一致）：
         1. close_vs_3y_peak >= 1.0  — 收盘站稳 3 年高点
@@ -1418,22 +1529,40 @@ def passes_watchlist_green(detail: dict) -> bool:
         3. still_above_rebound_close — 收盘仍高于 C 点
         4. w2_is_real_wash           — W2 为有效洗盘（真 N 结构）
 
+    附加（验证样本 P2）：
+        - 上证 MA20 上方 **或** 沪深300 近 20 日 ≥ 0；
+        - 锚点日非涨停（追板适合冲一波，不适合 watchlist 持有）；
+        - 排除 W 底形态。
+
     参数:
-        detail: 已合并 ``compute_t_day_quality`` 字段的候选 dict。
+        detail:       已合并 ``compute_t_day_quality`` 字段的候选 dict。
+        market_feat:  ``env_features_at`` 返回的大盘特征；None 时不校验大盘。
 
     返回:
-        bool，四条件全部满足时为 True。
+        bool，全部满足时为 True。
     """
     cv3 = detail.get('close_vs_3y_peak')
     if cv3 is None or cv3 < 1.0:
         return False
-    # 使用 bool()：score/quality 链路中可能出现 numpy.bool_，不可直接用 ``is True``
     if not bool(detail.get('at_new_high_since_rebound')):
         return False
     if not bool(detail.get('still_above_rebound_close')):
         return False
     if not bool(detail.get('w2_is_real_wash')):
         return False
+
+    pattern = detail.get('pattern') or ''
+    if pattern.startswith('W底'):
+        return False
+    if detail.get('anchor_is_limit_up'):
+        return False
+
+    if market_feat:
+        sse_above = market_feat.get('sse_above_ma20')
+        hs_ret20 = market_feat.get('hs_ret20')
+        if sse_above is not True:
+            if hs_ret20 is None or float(hs_ret20) < 0:
+                return False
     return True
 
 
@@ -1470,6 +1599,19 @@ def run_quant_picker(t_date=None, top_k=20, debug_stock=None, watchlist_only=Fal
     end_date = dates[-1]
 
     logging.info(f"提取数据总区间: {start_date} 到 {end_date} (共 {len(dates)} 个交易日)")
+
+    # P0：选股日大盘环境分（基于 index_bar1d）
+    market_feat = env_features_at(end_date)
+    market_env = env_score(market_feat) if market_feat else {}
+    if market_feat:
+        logging.info(
+            f"大盘环境: 分={market_env.get('score')} {market_env.get('regime')} | "
+            f"上证MA20={'上' if market_feat.get('sse_above_ma20') else '下'} "
+            f"沪深300近20日={market_feat.get('hs_ret20')}%"
+            + (" [数据滞后]" if market_feat.get('stale') else "")
+        )
+    else:
+        logging.warning("无法读取 index_bar1d 环境特征，跳过大盘择时过滤")
     
     if debug_stock:
         logging.info(f"--- DEBUG 模式: 仅分析股票 {debug_stock} ---")
@@ -1617,25 +1759,30 @@ def run_quant_picker(t_date=None, top_k=20, debug_stock=None, watchlist_only=Fal
         # T 日动量确认（方案 A）：quality_bonus 参与最终排序
         quality = compute_t_day_quality(group_df, windows, monthly_info, detail, end_date)
         detail.update(quality)
-        detail['watchlist_pass'] = passes_watchlist_green(detail)
-        detail['final_score'] = round(
-            detail['total_score'] + monthly_bonus + quality['quality_bonus'], 2
-        )
+        detail['final_score'] = compute_final_score_with_adjustments(detail, pattern_desc)
+        detail['watchlist_pass'] = passes_watchlist_green(detail, market_feat)
+        detail['market_env_score'] = market_env.get('score')
+        detail['market_env_regime'] = market_env.get('regime')
 
         results.append(detail)
 
-    # 按 final_score 降序：微观分 + 月线 bonus + T 日 quality_bonus
+    # 按 final_score 降序
     results.sort(key=lambda x: x['final_score'], reverse=True)
+
+    # P0：大盘环境过滤候选池 / 调整 top_k
+    results, effective_top_k = apply_market_env_pool_filter(
+        results, market_env, watchlist_only, top_k,
+    )
 
     if watchlist_only:
         pool = [r for r in results if r.get('watchlist_pass')]
         logging.info(
-            f"Watchlist 四绿灯过滤: 候选 {len(results)} 只 -> 通过 {len(pool)} 只"
+            f"Watchlist 过滤: 候选 {len(results)} 只 -> 四绿灯+大盘 {len(pool)} 只"
         )
-        top_results = pool[:top_k]
+        top_results = pool[:effective_top_k]
         out_label = "Watchlist"
     else:
-        top_results = results[:top_k]
+        top_results = results[:effective_top_k]
         out_label = f"TOP-{len(top_results)}"
 
     logging.info(f"--- 选股完成，{out_label} ---")
@@ -1657,7 +1804,7 @@ def run_quant_picker(t_date=None, top_k=20, debug_stock=None, watchlist_only=Fal
     if watchlist_only:
         out_file = f"results/watchlist_{end_date}.json"
     else:
-        out_file = f"results/top_{top_k}_stocks_{end_date}.json"
+        out_file = f"results/top_{len(top_results)}_stocks_{end_date}.json"
     pd.DataFrame(top_results).to_json(out_file, orient='records', force_ascii=False, indent=2)
     logging.info(f"结果已保存至 {out_file}")
     
